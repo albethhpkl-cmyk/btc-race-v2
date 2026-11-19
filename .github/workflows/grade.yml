@@ -20,6 +20,11 @@ jobs:
     steps:
       - name: Checkout bot repo
         uses: actions/checkout@v4
+        with:
+          # grade-local fetches a specific commit from this clone; a shallow
+          # checkout (fetch-depth 1) does not contain it and the fetch fails
+          # with "Could not read <sha>". Full history is required.
+          fetch-depth: 0
 
       - name: Set up Node.js 22 (kit CLI)
         uses: actions/setup-node@v4
@@ -43,11 +48,15 @@ jobs:
 
       - name: grade-local run 1
         timeout-minutes: 25
-        run: node kit/cli/makefun.mjs grade-local --kit kit --bot . --driver docker 2>&1 | tee grade-run1.log
+        run: |
+          set -o pipefail
+          node kit/cli/makefun.mjs grade-local --kit kit --bot . --driver docker 2>&1 | tee grade-run1.log
 
       - name: grade-local run 2
         timeout-minutes: 25
-        run: node kit/cli/makefun.mjs grade-local --kit kit --bot . --driver docker 2>&1 | tee grade-run2.log
+        run: |
+          set -o pipefail
+          node kit/cli/makefun.mjs grade-local --kit kit --bot . --driver docker 2>&1 | tee grade-run2.log
 
       - name: Determinism check (result_sha256 must match, twice)
         run: |
