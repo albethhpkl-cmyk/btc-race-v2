@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+grade-run1.log
+grade-run2.log
+grade-run1/
+grade-run2/
