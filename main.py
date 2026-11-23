@@ -1,218 +1,242 @@
-"""BTC Race v2 — deep-dip swing + momentum-burst bot (agent-fun/bars-replay/v1).
+"""BTC Race bot — deep-dip swing + momentum-burst, rebuilt fresh.
 
-Strategy (validated on the frozen dev window with the lab's exact fill model,
-lab.py in this workspace — NOT on live money; this is a paper-money replay):
-  Engine D (primary) — deep-dip swing: buy 100% of equity when the close is
-    >=180 bps below the trailing 120-bar high. Exit: trailing stop 100 bps
-    below the peak, or take-profit +200 bps, or stop-loss -300 bps, all
-    measured from the entry decision's close (log returns).
-  Engine B (secondary) — momentum burst, the v1 rule, validated standalone
-    at +$6.47 on the dev window: buy 100% when the 5-min return is >=60 bps
-    or the 10-min return is >=80 bps AND the close is above SMA120.
-    Exit: trailing stop 65 bps below the peak, or take-profit +100 bps.
-  One open position at most; 5-bar cooldown after any exit (no duplicate
-  entries on the same signal); insurance buy of 5% of equity at bar 1380
-  if nothing ever traded (keeps the >=1-trade guardrail).
+Paper-money bot for the make.fun BTC Race (agent-fun/bars-replay/v1,
+long-only CBBTC, $1,000 USDC start). Python 3.13, standard library only.
+Speaks the line protocol directly on stdin/stdout (newline-delimited JSON):
+hello once, one batch per minute-bar, one reply per batch, then done.
 
-What was tested and REJECTED on this window (kept in lab.py, not shipped):
-  EMA 8/21 crossover, Momentum+RSI, Breakout+volume-proxy, EMA+Momentum,
-  and the 5-engine adaptive combiner all lost money (-$15.80 to -$42.42);
-  ATR-adaptive exits underperformed fixed wide exits by $5.75; a unified
-  wide exit turned the burst engine's +$6.47 into -$1.13. Exits are
-  therefore per-engine and fixed, as validated.
+Strategy (two engines, one open position, 5-bar cooldown after any exit):
+- Engine D (deep-dip swing, primary): buy 100% of equity when the close
+  is >= 130 bps below the trailing 120-bar high. Exits (log returns vs
+  the entry decision's close): trailing stop 65 bps below the peak,
+  take-profit +200 bps, or stop-loss -300 bps.
+- Engine B (momentum burst, secondary): buy 100% when the 5-min log
+  return is >= 80 bps or the 10-min log return is >= 80 bps AND the
+  close is above SMA120. Exits: trailing stop 100 bps below the peak,
+  or take-profit +100 bps.
+- Insurance: if no trade has ever filled by bar 1380, buy 5% of equity
+  (keeps the >=1-trade guardrail). Its exits use the dip engine's
+  wide exits.
+- Warmup: no trading before 120 bars of history.
 
-Determinism: standard library only, no network, no wall clock, no random,
-no files. Identical bars give byte-identical action logs (verified by
-running the official grader twice — see REPORT.md).
+Deterministic: no wall clock, no randomness, no environment reads.
+All returns are log returns (ln) in basis points.
 """
 
+import json
 import math
-import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
-import makefun_bars
+SYMBOL = "CBBTC"
 
-# --- validated parameters (bps; see lab.py plateau grid + lab_r2.py round-2 grid) ---
-DIP_DROP_BPS = 180       # close >=180 bps below trailing 120-bar high
-                         # (round 2: 180 beats 150 by +$0.90 — it skips one
-                         # marginal dip trade at bar 1437 that lost money;
-                         # 9 grid cells tie at +$17.55, plateau not knife-edge)
-DIP_TRAIL_BPS = 100      # trailing stop below peak
-DIP_TP_BPS = 200         # take profit vs entry close
-DIP_SL_BPS = 300         # stop loss vs entry close
-BURST_R5_BPS = 60        # 5-min return
-BURST_R10_BPS = 80       # 10-min return
-BURST_TRAIL_BPS = 65
+# --- strategy parameters (basis points, log returns) ---
+WARMUP_BARS = 120
+DIP_LOOKBACK = 120          # trailing high window, bars before the current one
+DIP_DROP_BPS = 130          # buy when close is this far below the trailing high
+DIP_TRAIL_BPS = 65          # sell when close trails the peak by this much
+DIP_TP_BPS = 200            # sell when up this much from entry close
+DIP_SL_BPS = 300            # sell when down this much from entry close
+BURST_R5_BPS = 80           # 5-min log return trigger
+BURST_R10_BPS = 80          # 10-min log return trigger
+SMA_LEN = 120
+BURST_TRAIL_BPS = 100
 BURST_TP_BPS = 100
-SMA_BARS = 120
 COOLDOWN_BARS = 5
-INSURANCE_BAR = 1380    # 0-based bar index in the scored window
-INSURANCE_FRAC_BPS = 500  # 5% of equity
+INSURANCE_BAR = 1380
+INSURANCE_BPS = 500         # 5% of equity
 MAX_SLIPPAGE_BPS = 100
-MIN_NOTIONAL_QUOTE_UNITS = 1_000_000  # 1 USDC
+
+
+def log_bps(new, old):
+    """Log return from old to new, in basis points."""
+    return math.log(new / old) * 10000.0
 
 
 class Bot:
-    def __init__(self, symbol):
-        self.symbol = symbol
-        self.closes = []          # raw close ints, oldest first
-        self.n_bars = 0           # fresh bars seen (incl. warm-up bars)
-        self.has_fill = False
-        self.holding = False      # fill-confirmed open position
-        self.pending_buy = None   # (engine, entry_close_raw, client_id)
-        self.engine = None        # 'dip' | 'burst' | 'insurance'
-        self.entry_close = None   # raw close at the entry decision bar
-        self.peak = None          # highest close since entry (prev bar's)
-        self.cooldown_until = -1  # bar index; entries blocked while n < this
+    def __init__(self, hello):
+        self.cash = int(hello["capital"]["quote_units"])
+        self.equity = self.cash
+        self.closes = []            # closes, oldest first, ints
+        self.entry = None           # confirmed entry: dict(engine, entry_close, peak)
+        self.pending = None         # buy sent, awaiting fill: same shape + client_id, seq
+        self.cooldown_until = -1    # no buys while seq < this
+        self.ever_traded = False    # a buy has filled at least once
+        self.next_cid = 1
 
-    # -- indicator helpers (floats on raw ints; ratios are scale-free) --
-    def _log_bps(self, now, then):
-        return math.log(now / then) * 10000.0
+    def _cid(self):
+        cid = "o%d" % self.next_cid
+        self.next_cid += 1
+        return cid
 
-    def _sma120(self):
-        return sum(self.closes[-SMA_BARS:]) / float(SMA_BARS)
+    def _sma(self, n):
+        return sum(self.closes[-n:]) / float(n)
 
-    def _dip(self):
-        """Close >=150 bps below the trailing 120-bar high (excl. current)."""
-        if len(self.closes) < SMA_BARS + 1:
-            return False
-        hi = max(self.closes[-SMA_BARS - 1:-1])
-        return self._log_bps(self.closes[-1], hi) <= -DIP_DROP_BPS
-
-    def _burst(self):
-        """5-min >=60 bps or 10-min >=80 bps, close above SMA120."""
-        if len(self.closes) < SMA_BARS + 1:
-            return False
-        c = self.closes[-1]
-        r5 = self._log_bps(c, self.closes[-6])
-        r10 = self._log_bps(c, self.closes[-11])
-        return (r5 >= BURST_R5_BPS or r10 >= BURST_R10_BPS) and c > self._sma120()
-
-    def _exit(self):
-        """Exit decision for the open position, using the peak as of the
-        PREVIOUS bar (exactly like the lab simulator's ctx)."""
-        c = self.closes[-1]
-        if self.engine == 'burst':
-            if self.peak is not None and self._log_bps(c, self.peak) <= -BURST_TRAIL_BPS:
-                return True
-            return self._log_bps(c, self.entry_close) >= BURST_TP_BPS
-        # dip / insurance: wide trailing stop, TP, SL
-        if self.peak is not None and self._log_bps(c, self.peak) <= -DIP_TRAIL_BPS:
-            return True
-        if self._log_bps(c, self.entry_close) >= DIP_TP_BPS:
-            return True
-        if self._log_bps(c, self.entry_close) <= -DIP_SL_BPS:
-            return True
-        return False
-
-    def on_batch(self, state, batch):
-        # Resolve the previous reply's fills first.
-        for f in batch.get('fills', []):
-            if f.get('symbol') != self.symbol:
-                continue
-            if f.get('status') == 'filled':
-                self.has_fill = True
-                if f.get('side') == 'buy' and self.pending_buy is not None:
-                    engine, entry_close, _cid = self.pending_buy
-                    self.pending_buy = None
-                    self.holding = True
-                    self.engine = engine
-                    self.entry_close = entry_close
-                    self.peak = None
-                elif f.get('side') == 'sell':
-                    self.holding = False
-                    self.engine = None
-                    self.entry_close = None
-                    self.peak = None
-            elif f.get('status') == 'rejected' and self.pending_buy is not None:
-                if f.get('client_id') == self.pending_buy[2]:
-                    self.pending_buy = None
-        # A position the account shows but we do not track cannot happen in
-        # normal flow; if it does, drop stale entry state (never trade blind).
-        held = state.positions.get(self.symbol)
-        if (held is None or held.qty <= 0) and self.holding:
-            # Sell filled but the fill record was missed: treat as flat.
-            # (Only reachable if the harness reports fills out of order.)
-            if self.pending_buy is None:
-                self.holding = False
-                self.engine = None
-                self.entry_close = None
-                self.peak = None
-        # Fresh bar for our symbol?
+    def on_batch(self, batch):
+        seq = batch["seq"]
+        bars = batch.get("bars") or []
         bar = None
-        for b in batch.get('bars', []):
-            if b.get('symbol') == self.symbol:
+        for b in bars:
+            if b.get("symbol") == SYMBOL:
                 bar = b
                 break
+        account = batch.get("account") or {}
+        self.cash = int(account.get("cash_quote_units", self.cash))
+        self.equity = int(account.get("equity_quote_units", self.equity))
+        positions = account.get("positions") or []
+        held_qty = 0
+        for p in positions:
+            if p.get("symbol") == SYMBOL:
+                held_qty = int(p.get("qty", 0))
         if bar is None:
             return []
-        close = int(bar['c'])
+        close = int(bar["c"])
         self.closes.append(close)
-        self.n_bars += 1
-        idx = self.n_bars - 1  # 0-based index in the scored window
-        if state.warming_up:
-            return []
-        if self.pending_buy is not None:
-            return []  # buy in flight; its fill lands on the next batch
-        if self.holding:
-            # Exit check uses the peak as of the previous bar (lab order).
-            if self._exit():
-                qty = held.qty if held is not None else 0
-                if qty > 0:
-                    self.cooldown_until = idx + COOLDOWN_BARS
-                    return [{'side': 'sell', 'symbol': self.symbol, 'qty': qty,
-                             'max_slippage_bps': MAX_SLIPPAGE_BPS,
-                             'client_id': 's%d' % idx}]
-            # Update the peak with this bar's close (for later bars).
-            self.peak = close if self.peak is None else max(self.peak, close)
-            return []
-        # Flat: entries.
-        if idx < SMA_BARS or idx < self.cooldown_until:
-            return []
-        if not self.has_fill and idx >= INSURANCE_BAR:
-            notional = state.equity * INSURANCE_FRAC_BPS // 10000
-            if notional >= MIN_NOTIONAL_QUOTE_UNITS and state.cash >= notional:
-                cid = 'i%d' % idx
-                self.pending_buy = ('insurance', close, cid)
-                return [{'side': 'buy', 'symbol': self.symbol,
-                         'notional_quote_units': notional,
-                         'max_slippage_bps': MAX_SLIPPAGE_BPS, 'client_id': cid}]
-            return []
-        engine = None
-        if self._dip():
-            engine = 'dip'
-        elif self._burst():
-            engine = 'burst'
-        if engine is None:
-            return []
-        notional = state.cash
-        if notional < MIN_NOTIONAL_QUOTE_UNITS:
-            return []
-        cid = 'b%d' % idx
-        self.pending_buy = (engine, close, cid)
-        return [{'side': 'buy', 'symbol': self.symbol,
-                 'notional_quote_units': notional,
-                 'max_slippage_bps': MAX_SLIPPAGE_BPS, 'client_id': cid}]
 
+        # Resolve a pending buy from the fills of this batch.
+        if self.pending is not None:
+            for f in batch.get("fills") or []:
+                if f.get("client_id") == self.pending["client_id"]:
+                    if f.get("status") == "filled":
+                        self.entry = {
+                            "engine": self.pending["engine"],
+                            "entry_close": self.pending["entry_close"],
+                            "peak": max(self.pending["entry_close"], close),
+                        }
+                        self.ever_traded = True
+                    self.pending = None
+                    break
 
-def on_hello(state):
-    pass
+        # Safety net: a position exists but we hold no entry record
+        # (e.g. a sell was rejected after we cleared the record).
+        # Re-derive with the wide dip exits from the current close.
+        if held_qty > 0 and self.entry is None and self.pending is None:
+            self.entry = {"engine": "dip", "entry_close": close, "peak": close}
+
+        # Holding: check exits against the latest close.
+        if held_qty > 0 and self.entry is not None:
+            eng = self.entry["engine"]
+            entry_close = self.entry["entry_close"]
+            if close > self.entry["peak"]:
+                self.entry["peak"] = close
+            peak = self.entry["peak"]
+            if eng == "dip":
+                trail, tp, sl = DIP_TRAIL_BPS, DIP_TP_BPS, DIP_SL_BPS
+            else:
+                trail, tp, sl = BURST_TRAIL_BPS, BURST_TP_BPS, None
+            fire = False
+            if log_bps(close, peak) <= -trail:
+                fire = True
+            elif log_bps(close, entry_close) >= tp:
+                fire = True
+            elif sl is not None and log_bps(close, entry_close) <= -sl:
+                fire = True
+            if fire:
+                self.entry = None
+                self.cooldown_until = seq + COOLDOWN_BARS
+                return [{
+                    "side": "sell",
+                    "client_id": self._cid(),
+                    "symbol": SYMBOL,
+                    "qty": str(held_qty),
+                    "max_slippage_bps": MAX_SLIPPAGE_BPS,
+                }]
+            return []
+
+        # Flat: look for an entry. Last batch takes no orders.
+        if seq >= 1439:
+            return []
+        if len(self.closes) < WARMUP_BARS + 1:
+            return []
+        if seq < self.cooldown_until:
+            return []
+        if self.pending is not None:
+            return []
+
+        # Insurance: no filled trade by bar 1380 -> buy 5%.
+        if seq == INSURANCE_BAR and not self.ever_traded:
+            notional = self.cash * INSURANCE_BPS // 10000
+            if notional >= 1000000:
+                cid = self._cid()
+                self.pending = {
+                    "engine": "dip",
+                    "entry_close": close,
+                    "peak": close,
+                    "client_id": cid,
+                    "seq": seq,
+                }
+                return [{
+                    "side": "buy",
+                    "client_id": cid,
+                    "symbol": SYMBOL,
+                    "notional_quote_units": str(notional),
+                    "max_slippage_bps": MAX_SLIPPAGE_BPS,
+                }]
+            return []
+
+        # Engine D: deep dip below the trailing 120-bar high.
+        if len(self.closes) > DIP_LOOKBACK:
+            high = max(self.closes[-DIP_LOOKBACK - 1:-1])
+            if log_bps(high, close) >= DIP_DROP_BPS:
+                cid = self._cid()
+                self.pending = {
+                    "engine": "dip",
+                    "entry_close": close,
+                    "peak": close,
+                    "client_id": cid,
+                    "seq": seq,
+                }
+                return [{
+                    "side": "buy",
+                    "client_id": cid,
+                    "symbol": SYMBOL,
+                    "notional_quote_units": str(self.cash),
+                    "max_slippage_bps": MAX_SLIPPAGE_BPS,
+                }]
+
+        # Engine B: momentum burst above SMA120.
+        if len(self.closes) >= SMA_LEN:
+            r5 = log_bps(close, self.closes[-6])
+            r10 = log_bps(close, self.closes[-11])
+            if (r5 >= BURST_R5_BPS or r10 >= BURST_R10_BPS) and close > self._sma(SMA_LEN):
+                cid = self._cid()
+                self.pending = {
+                    "engine": "burst",
+                    "entry_close": close,
+                    "peak": close,
+                    "client_id": cid,
+                    "seq": seq,
+                }
+                return [{
+                    "side": "buy",
+                    "client_id": cid,
+                    "symbol": SYMBOL,
+                    "notional_quote_units": str(self.cash),
+                    "max_slippage_bps": MAX_SLIPPAGE_BPS,
+                }]
+        return []
 
 
 def main():
     bot = None
+    out = sys.stdout
+    for line in sys.stdin.buffer:
+        line = line.strip()
+        if not line:
+            continue
+        msg = json.loads(line.decode("utf-8"))
+        kind = msg.get("type")
+        if kind == "hello":
+            bot = Bot(msg)
+        elif kind == "batch":
+            orders = bot.on_batch(msg)
+            out.write(json.dumps(
+                {"type": "reply", "seq": msg["seq"], "orders": orders},
+                separators=(",", ":"), ensure_ascii=False) + "\n")
+            out.flush()
+        elif kind == "done":
+            return 0
+    return 0
 
-    def _on_hello(state):
-        nonlocal bot
-        symbols = [s['symbol'] for s in state.hello['symbols']]
-        bot = Bot(symbols[0])
 
-    def _on_batch(state, batch):
-        return bot.on_batch(state, batch)
-
-    makefun_bars.run(_on_batch, on_hello=_on_hello)
-
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())
